@@ -1,0 +1,861 @@
+openapi: 3.1.0
+info:
+  title: Kahoot-style Quiz Game API
+  version: 1.0.0
+  description: |
+    API specification for a Kahoot-style quiz game that supports up to 30,000
+    players in a single game and many concurrent games.
+
+    ## Architecture
+    The system is split into two parts:
+
+    * **Control plane (Directory API)**: API Gateway HTTP API + Directory Lambda.
+      Lists quizzes, places new games on a game server (best-fit slot reservation
+      in DynamoDB), and tells clients which game server hosts a PIN.
+    * **Data plane (Game servers)**: Go servers in Docker on EC2 instances in an
+      Auto Scaling group. Each game lives entirely in the memory of one game
+      server. Clients connect to it directly over WebSocket (`ws://<ip>:8080/ws`).
+
+    The following parts are internal and have no public API. They are listed under
+    `x-internal` at the end of this file:
+    * the Fleet Manager Lambda (the autoscaler, run by an EventBridge rule every minute)
+    * the server heartbeats written to DynamoDB
+
+    ## Client flows
+    * **Host:** `GET /quizzes`, then `POST /games` (returns `wsUrl` + `hostToken`),
+      then connect to `wsUrl`, then send the `host_claim` message.
+    * **Player:** `GET /games/{pin}` (returns `wsUrl`), then connect to `wsUrl`, then
+      send `join`. To reconnect after a dropped connection, send `rejoin` with the
+      saved token.
+
+    ## How the WebSocket protocol is documented
+    OpenAPI cannot describe WebSocket messages, so this file documents them in the
+    `x-websocket` section at the bottom:
+    * Every message is a JSON object with a `type` field.
+    * The message schemas live under `components/schemas`.
+    * Errors are sent as `error` messages that carry an HTTP-like `status` and a
+      machine-readable `code`.
+
+tags:
+  - name: Quizzes
+    description: Read quizzes stored in DynamoDB (Directory API).
+  - name: Games
+    description: Create and look up games (Directory API).
+  - name: Game Server
+    description: HTTP endpoints served by each EC2 game server.
+
+servers:
+  - url: https://{apiId}.execute-api.us-east-1.amazonaws.com
+    description: Directory API (API Gateway HTTP API, control plane)
+    variables:
+      apiId:
+        default: abc123
+        description: API Gateway API ID (a CloudFormation stack output)
+
+paths:
+  # ───────────────────────── Directory API (control plane) ─────────────────────────
+  /quizzes:
+    get:
+      tags: [Quizzes]
+      operationId: listQuizzes
+      summary: List available quizzes
+      description: Used by the host CLI to choose a quiz before creating a game.
+      parameters:
+        - name: limit
+          in: query
+          required: false
+          schema: { type: integer, minimum: 1, maximum: 100, default: 25 }
+        - name: nextToken
+          in: query
+          required: false
+          description: Pagination token from a previous response.
+          schema: { type: string }
+      responses:
+        '200':
+          description: A page of quizzes.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/QuizList' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '429': { $ref: '#/components/responses/TooManyRequests' }
+        '500': { $ref: '#/components/responses/InternalError' }
+
+  /quizzes/{quizId}:
+    get:
+      tags: [Quizzes]
+      operationId: getQuiz
+      summary: Get one quiz's summary
+      description: |
+        Returns the quiz metadata and question count. Question text is not
+        included here, so this endpoint cannot be used to read the answers ahead
+        of time. The host receives the question text over the WebSocket during the game.
+      parameters:
+        - $ref: '#/components/parameters/QuizId'
+      responses:
+        '200':
+          description: Quiz summary.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/QuizSummary' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '429': { $ref: '#/components/responses/TooManyRequests' }
+        '500': { $ref: '#/components/responses/InternalError' }
+
+  /games:
+    post:
+      tags: [Games]
+      operationId: createGame
+      summary: Create a game and assign it to a game server
+      description: |
+        Steps the Directory Lambda performs:
+        1. Validate that the quiz exists.
+        2. Pick the ACTIVE game server whose heartbeat is fresh (< 30 s) and that
+           has the **least** free slots that still fit `maxPlayers` (best fit).
+        3. Atomically reserve `maxPlayers` slots with a conditional DynamoDB update.
+        4. Create the `Games[pin]` item with status `CREATED`.
+        5. Asynchronously invoke the Fleet Manager if this used the last empty
+           server.
+
+        The host must connect to `wsUrl` and send `host_claim` before `claimBy`.
+        Otherwise the game expires and its slots are released.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/CreateGameRequest' }
+      responses:
+        '201':
+          description: Game created and placed on a server.
+          headers:
+            Location:
+              description: URL of the new game resource (`/games/{pin}`).
+              schema: { type: string }
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/GameCreated' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '429': { $ref: '#/components/responses/TooManyRequests' }
+        '500': { $ref: '#/components/responses/InternalError' }
+        '503':
+          description: |
+            No game server currently has enough free slots. The Fleet Manager has
+            been triggered to add capacity. Retry after `Retry-After` seconds.
+          headers:
+            Retry-After:
+              $ref: '#/components/headers/RetryAfter'
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+              example:
+                error: NO_CAPACITY
+                message: No game server has 30000 free slots. Capacity is starting; retry shortly.
+                retryAfterSec: 60
+
+  /games/{pin}:
+    get:
+      tags: [Games]
+      operationId: getGame
+      summary: Look up which game server hosts a PIN
+      description: |
+        Players call this before connecting. Clients also call it when a reconnect
+        to `wsUrl` fails, to check whether the game is still running.
+      parameters:
+        - $ref: '#/components/parameters/Pin'
+      responses:
+        '200':
+          description: Game is active (CREATED, LOBBY or PLAYING).
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/GameLookup' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '410':
+          description: Game is over (ENDED, FAILED or EXPIRED) and can no longer be joined.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/GameGone' }
+        '429': { $ref: '#/components/responses/TooManyRequests' }
+        '500': { $ref: '#/components/responses/InternalError' }
+
+  /games/{pin}/results:
+    get:
+      tags: [Games]
+      operationId: getGameResults
+      summary: Get the final leaderboard of a finished game
+      description: Reads from the DynamoDB `Results` table after the game ends.
+      parameters:
+        - $ref: '#/components/parameters/Pin'
+        - name: limit
+          in: query
+          required: false
+          description: Number of leaderboard entries to return.
+          schema: { type: integer, minimum: 1, maximum: 100, default: 10 }
+      responses:
+        '200':
+          description: Final results.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/FinalResults' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '409':
+          description: The game has not finished yet (status CREATED, LOBBY or PLAYING).
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+              example: { error: GAME_NOT_FINISHED, message: Game 482193 is still PLAYING. }
+        '410':
+          description: The game FAILED or EXPIRED, so no results were saved.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/GameGone' }
+        '429': { $ref: '#/components/responses/TooManyRequests' }
+        '500': { $ref: '#/components/responses/InternalError' }
+
+  # ───────────────────────── Game server (data plane) ─────────────────────────
+  /healthz:
+    servers:
+      - url: http://{serverIp}:8080
+        description: An individual EC2 game server
+        variables:
+          serverIp: { default: 10.0.0.1 }
+    get:
+      tags: [Game Server]
+      operationId: healthCheck
+      summary: Game server health and load
+      description: |
+        Used for debugging, load-test monitoring and deployment scripts. The Fleet
+        Manager does not call this endpoint; it relies on the DynamoDB heartbeats.
+      responses:
+        '200':
+          description: Server is healthy and accepting new games.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Health' }
+        '503':
+          description: Server is DRAINING, still starting, or not registered in DynamoDB.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Health' }
+
+  /ws:
+    servers:
+      - url: ws://{serverIp}:8080
+        description: An individual EC2 game server (use the `wsUrl` returned by the Directory API)
+        variables:
+          serverIp: { default: 10.0.0.1 }
+    get:
+      tags: [Game Server]
+      operationId: openWebSocket
+      summary: Open a WebSocket connection to a game server
+      description: |
+        Standard WebSocket upgrade. No authentication happens at upgrade time.
+        The first message must be `host_claim`, `join` or `rejoin`, sent within
+        10 seconds; otherwise the server closes the connection with code 4008.
+        See `x-websocket` for all messages.
+      parameters:
+        - { name: Connection, in: header, required: true, schema: { type: string, const: Upgrade } }
+        - { name: Upgrade, in: header, required: true, schema: { type: string, const: websocket } }
+        - { name: Sec-WebSocket-Version, in: header, required: true, schema: { type: string, const: '13' } }
+        - { name: Sec-WebSocket-Key, in: header, required: true, schema: { type: string } }
+      responses:
+        '101':
+          description: Switching Protocols. The WebSocket connection is open.
+        '400':
+          description: Malformed upgrade request (missing or invalid WebSocket headers).
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+        '426':
+          description: Upgrade Required. A plain HTTP request was sent to the WebSocket endpoint.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+        '503':
+          description: Server is shutting down or has hit its hard connection limit.
+          headers:
+            Retry-After:
+              $ref: '#/components/headers/RetryAfter'
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+
+components:
+  parameters:
+    Pin:
+      name: pin
+      in: path
+      required: true
+      description: 6-digit game PIN.
+      schema: { $ref: '#/components/schemas/Pin' }
+    QuizId:
+      name: quizId
+      in: path
+      required: true
+      schema: { type: string, minLength: 1, maxLength: 64 }
+
+  headers:
+    RetryAfter:
+      description: Seconds to wait before retrying.
+      schema: { type: integer, minimum: 1, example: 60 }
+
+  responses:
+    BadRequest:
+      description: The request failed validation (bad JSON, field out of range, or malformed PIN).
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/Error' }
+          example: { error: VALIDATION_ERROR, message: maxPlayers must be between 1 and 30000 }
+    NotFound:
+      description: The quiz or game does not exist (or its TTL has expired).
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/Error' }
+          example: { error: NOT_FOUND, message: Game 482193 not found }
+    TooManyRequests:
+      description: Throttled by the API Gateway stage rate limit.
+      headers:
+        Retry-After:
+          $ref: '#/components/headers/RetryAfter'
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/Error' }
+          example: { error: THROTTLED, message: Too many requests }
+    InternalError:
+      description: Unexpected server error.
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/Error' }
+          example: { error: INTERNAL, message: Internal server error }
+
+  schemas:
+    # ─────────────── Shared ───────────────
+    Pin:
+      type: string
+      pattern: '^[0-9]{6}$'
+      example: '482193'
+    Username:
+      type: string
+      description: 1-20 characters. Letters, digits, spaces, `_`, `-` and `.`. Must be unique within a game (case-insensitive).
+      pattern: '^[A-Za-z0-9_ .-]{1,20}$'
+      example: speedy_sam
+    GameStatus:
+      type: string
+      description: |
+        Status stored in the DynamoDB `Games` table:
+        * `CREATED`: placed on a server; the host has not connected yet.
+        * `LOBBY`: host connected; players are joining.
+        * `PLAYING`: game has started (new joins are locked; rejoins are allowed).
+        * `ENDED`: finished normally; results saved.
+        * `FAILED`: the game server crashed or stopped heartbeating.
+        * `EXPIRED`: the host never claimed the game, or the lobby sat idle too long.
+      enum: [CREATED, LOBBY, PLAYING, ENDED, FAILED, EXPIRED]
+    GamePhase:
+      type: string
+      description: In-memory phase of a game on its game server.
+      enum: [LOBBY, QUESTION, RESULTS, FINISHED]
+    Error:
+      type: object
+      required: [error, message]
+      properties:
+        error:
+          type: string
+          description: Machine-readable error code.
+          enum: [VALIDATION_ERROR, NOT_FOUND, NO_CAPACITY, GAME_NOT_FINISHED, THROTTLED,
+                 UPGRADE_REQUIRED, SERVER_UNAVAILABLE, INTERNAL]
+        message: { type: string }
+        retryAfterSec: { type: integer, minimum: 1 }
+        details:
+          type: object
+          additionalProperties: true
+    LeaderboardEntry:
+      type: object
+      required: [rank, username, score]
+      properties:
+        rank: { type: integer, minimum: 1, description: 'Competition ranking: tied scores share a rank (1, 2, 2, 4).' }
+        username: { $ref: '#/components/schemas/Username' }
+        score: { type: integer, minimum: 0 }
+
+    # ─────────────── Quizzes ───────────────
+    QuizSummary:
+      type: object
+      required: [quizId, title, questionCount]
+      properties:
+        quizId: { type: string, example: cs6650-week1 }
+        title: { type: string, example: Distributed Systems Basics }
+        questionCount: { type: integer, minimum: 1, example: 10 }
+        defaultTimeLimitSec: { type: integer, example: 20 }
+    QuizList:
+      type: object
+      required: [quizzes]
+      properties:
+        quizzes:
+          type: array
+          items: { $ref: '#/components/schemas/QuizSummary' }
+        nextToken:
+          type: [string, 'null']
+          description: Pass this as `nextToken` to get the next page. `null` means there are no more pages.
+    Question:
+      type: object
+      description: Stored question format in the DynamoDB `Quizzes` table (never returned by the Directory API).
+      required: [text, options, correctIndex, timeLimitSec]
+      properties:
+        text: { type: string }
+        options:
+          type: array
+          minItems: 4
+          maxItems: 4
+          items: { type: string }
+        correctIndex: { type: integer, minimum: 0, maximum: 3 }
+        timeLimitSec: { type: integer, minimum: 5, maximum: 120 }
+
+    # ─────────────── Games (Directory API) ───────────────
+    CreateGameRequest:
+      type: object
+      required: [quizId]
+      properties:
+        quizId: { type: string, example: cs6650-week1 }
+        maxPlayers:
+          type: integer
+          minimum: 1
+          maximum: 30000
+          default: 1000
+          description: Slots to reserve on the game server. Joins beyond this limit are rejected with GAME_FULL.
+    GameCreated:
+      type: object
+      required: [pin, gameId, wsUrl, hostToken, quizId, maxPlayers, status, claimBy]
+      properties:
+        pin: { $ref: '#/components/schemas/Pin' }
+        gameId: { type: string, format: uuid }
+        wsUrl: { type: string, example: 'ws://3.91.20.14:8080/ws' }
+        hostToken:
+          type: string
+          description: 128-bit random secret, base64url-encoded. Only its SHA-256 hash is stored. Required for `host_claim`.
+        quizId: { type: string }
+        maxPlayers: { type: integer }
+        status: { type: string, const: CREATED }
+        claimBy:
+          type: string
+          format: date-time
+          description: The host must send `host_claim` before this time (createdAt + 10 min), or the game expires.
+    GameLookup:
+      type: object
+      required: [pin, wsUrl, status, joinable]
+      properties:
+        pin: { $ref: '#/components/schemas/Pin' }
+        wsUrl: { type: string, example: 'ws://3.91.20.14:8080/ws' }
+        status: { type: string, enum: [CREATED, LOBBY, PLAYING] }
+        joinable:
+          type: boolean
+          description: True only in LOBBY. Once PLAYING, only `rejoin` with an existing token works.
+    GameGone:
+      type: object
+      required: [pin, status]
+      properties:
+        pin: { $ref: '#/components/schemas/Pin' }
+        status: { type: string, enum: [ENDED, FAILED, EXPIRED] }
+        message: { type: string, example: The game server hosting this game failed. }
+    FinalResults:
+      type: object
+      required: [pin, gameId, quizId, endedAt, playerCount, leaderboard]
+      properties:
+        pin: { $ref: '#/components/schemas/Pin' }
+        gameId: { type: string, format: uuid }
+        quizId: { type: string }
+        endedAt: { type: string, format: date-time }
+        playerCount: { type: integer }
+        leaderboard:
+          type: array
+          items: { $ref: '#/components/schemas/LeaderboardEntry' }
+
+    # ─────────────── Game server HTTP ───────────────
+    Health:
+      type: object
+      required: [status, serverId, version]
+      properties:
+        status: { type: string, enum: [ok, starting, draining] }
+        serverId: { type: string, example: i-0abc123def4567890 }
+        version: { type: string, example: v3, description: Docker image tag. }
+        capacity: { type: integer, example: 32000 }
+        reserved: { type: integer, example: 30500 }
+        connections: { type: integer, example: 29874 }
+        activeGames: { type: integer, example: 2 }
+        uptimeSec: { type: integer }
+
+    # ─────────────── WebSocket: client → server ───────────────
+    WsHostClaim:
+      type: object
+      description: Host attaches to their game. Used for the first connection and for reconnects.
+      required: [type, pin, hostToken]
+      properties:
+        type: { const: host_claim }
+        reqId: { $ref: '#/components/schemas/ReqId' }
+        pin: { $ref: '#/components/schemas/Pin' }
+        hostToken: { type: string }
+    WsJoin:
+      type: object
+      description: New player joins a game in LOBBY.
+      required: [type, pin, username]
+      properties:
+        type: { const: join }
+        reqId: { $ref: '#/components/schemas/ReqId' }
+        pin: { $ref: '#/components/schemas/Pin' }
+        username: { $ref: '#/components/schemas/Username' }
+    WsRejoin:
+      type: object
+      description: Returning player reconnects using the token from `joined`. Allowed in any phase except FINISHED.
+      required: [type, pin, token]
+      properties:
+        type: { const: rejoin }
+        reqId: { $ref: '#/components/schemas/ReqId' }
+        pin: { $ref: '#/components/schemas/Pin' }
+        token: { type: string }
+    WsStart:
+      type: object
+      description: Host only, LOBBY phase. Locks new joins, shrinks the slot reservation to the actual player count, and opens question 0.
+      required: [type]
+      properties:
+        type: { const: start }
+        reqId: { $ref: '#/components/schemas/ReqId' }
+    WsNext:
+      type: object
+      description: Host only, RESULTS phase. Opens the next question, or finishes the game after the last question.
+      required: [type]
+      properties:
+        type: { const: next }
+        reqId: { $ref: '#/components/schemas/ReqId' }
+    WsEnd:
+      type: object
+      description: Host only, any phase except FINISHED. Ends the game early. Results are still saved.
+      required: [type]
+      properties:
+        type: { const: end }
+        reqId: { $ref: '#/components/schemas/ReqId' }
+    WsAnswer:
+      type: object
+      description: |
+        Player only, QUESTION phase. The server accepts the answer only if all of these hold:
+        * `qIndex` is the current question;
+        * the player has not answered this question yet;
+        * `now <= deadline` (qSentAt + timeLimit + 1 s grace);
+        * `0 <= responseMs <= (now - qSentAt) + 500`.
+
+        Points for a correct answer = round(1000 × (1 − responseMs / (2 × timeLimitMs))).
+        Points for a wrong answer = 0.
+      required: [type, qIndex, choice, responseMs]
+      properties:
+        type: { const: answer }
+        reqId: { $ref: '#/components/schemas/ReqId' }
+        qIndex: { type: integer, minimum: 0 }
+        choice: { type: integer, minimum: 0, maximum: 3 }
+        responseMs:
+          type: integer
+          minimum: 0
+          description: Measured by the client from receiving `question` to the key press (monotonic clock).
+
+    # ─────────────── WebSocket: server → client ───────────────
+    WsClaimed:
+      type: object
+      description: Sent to the host after a successful `host_claim`. Also tells a reconnecting host the current state.
+      required: [type, pin, gameId, quizTitle, questionCount, maxPlayers, phase, playerCount]
+      properties:
+        type: { const: claimed }
+        reqId: { $ref: '#/components/schemas/ReqId' }
+        pin: { $ref: '#/components/schemas/Pin' }
+        gameId: { type: string, format: uuid }
+        quizTitle: { type: string }
+        questionCount: { type: integer }
+        maxPlayers: { type: integer }
+        phase: { $ref: '#/components/schemas/GamePhase' }
+        qIndex: { type: [integer, 'null'], description: 'Current question, or null while in LOBBY.' }
+        playerCount: { type: integer }
+    WsJoined:
+      type: object
+      description: Sent to a player after a successful `join`. The client must save `token` for reconnection.
+      required: [type, pin, playerId, token, username]
+      properties:
+        type: { const: joined }
+        reqId: { $ref: '#/components/schemas/ReqId' }
+        pin: { $ref: '#/components/schemas/Pin' }
+        playerId: { type: string }
+        token: { type: string, description: '128-bit random secret, base64url-encoded.' }
+        username: { $ref: '#/components/schemas/Username' }
+    WsSnapshot:
+      type: object
+      description: Sent to a player after a successful `rejoin`. It carries enough state for the client to redraw its screen.
+      required: [type, pin, phase, questionCount, score, username]
+      properties:
+        type: { const: snapshot }
+        reqId: { $ref: '#/components/schemas/ReqId' }
+        pin: { $ref: '#/components/schemas/Pin' }
+        username: { $ref: '#/components/schemas/Username' }
+        phase: { $ref: '#/components/schemas/GamePhase' }
+        questionCount: { type: integer }
+        qIndex: { type: [integer, 'null'] }
+        timeLeftMs: { type: [integer, 'null'], description: Set only in the QUESTION phase. }
+        answeredCurrent: { type: boolean, description: True if the player already answered the open question. }
+        score: { type: integer }
+        rank: { type: [integer, 'null'], description: Rank after the last closed question. }
+    WsLobby:
+      type: object
+      description: Sent to the host about once per second during LOBBY.
+      required: [type, playerCount, connectedCount, maxPlayers]
+      properties:
+        type: { const: lobby }
+        playerCount: { type: integer }
+        connectedCount: { type: integer }
+        maxPlayers: { type: integer }
+    WsQuestion:
+      type: object
+      description: Sent to all players when a question opens. Players see only four answer keys.
+      required: [type, qIndex, questionCount, timeLimitMs, sentAt]
+      properties:
+        type: { const: question }
+        qIndex: { type: integer }
+        questionCount: { type: integer }
+        timeLimitMs: { type: integer }
+        sentAt: { type: integer, description: 'Server time in epoch ms. Used for load-test measurements, not for scoring.' }
+    WsHostQuestion:
+      type: object
+      description: Sent to the host when a question opens. Includes the question text and options to display.
+      required: [type, qIndex, questionCount, timeLimitMs, text, options]
+      properties:
+        type: { const: host_question }
+        qIndex: { type: integer }
+        questionCount: { type: integer }
+        timeLimitMs: { type: integer }
+        text: { type: string }
+        options:
+          type: array
+          minItems: 4
+          maxItems: 4
+          items: { type: string }
+    WsAnswerAck:
+      type: object
+      description: Sent to a player when their answer is accepted. Correctness is revealed later in `results`.
+      required: [type, qIndex]
+      properties:
+        type: { const: answer_ack }
+        reqId: { $ref: '#/components/schemas/ReqId' }
+        qIndex: { type: integer }
+    WsProgress:
+      type: object
+      description: Sent to the host at most every 500 ms during QUESTION.
+      required: [type, qIndex, answered, connected, timeLeftMs]
+      properties:
+        type: { const: progress }
+        qIndex: { type: integer }
+        answered: { type: integer }
+        connected: { type: integer }
+        timeLeftMs: { type: integer }
+    WsResults:
+      type: object
+      description: |
+        A personal message sent to each player when a question closes. The question
+        closes when the timer expires or when every connected player has answered,
+        whichever happens first.
+      required: [type, qIndex, correctIndex, correct, points, score, rank, playerCount, top5]
+      properties:
+        type: { const: results }
+        qIndex: { type: integer }
+        correctIndex: { type: integer, minimum: 0, maximum: 3 }
+        yourChoice: { type: [integer, 'null'], description: 'null if the player did not answer.' }
+        correct: { type: boolean }
+        points: { type: integer, minimum: 0, maximum: 1000 }
+        score: { type: integer }
+        rank: { type: integer }
+        playerCount: { type: integer }
+        top5:
+          type: array
+          maxItems: 5
+          items: { $ref: '#/components/schemas/LeaderboardEntry' }
+    WsHostResults:
+      type: object
+      description: Sent to the host when a question closes.
+      required: [type, qIndex, correctIndex, distribution, answered, playerCount, top5, isLastQuestion, closedBy]
+      properties:
+        type: { const: host_results }
+        qIndex: { type: integer }
+        correctIndex: { type: integer, minimum: 0, maximum: 3 }
+        distribution:
+          type: array
+          description: Number of answers for each option.
+          minItems: 4
+          maxItems: 4
+          items: { type: integer }
+        answered: { type: integer }
+        playerCount: { type: integer }
+        top5:
+          type: array
+          maxItems: 5
+          items: { $ref: '#/components/schemas/LeaderboardEntry' }
+        isLastQuestion: { type: boolean }
+        closedBy: { type: string, enum: [TIMER, ALL_ANSWERED] }
+    WsFinal:
+      type: object
+      description: |
+        Sent to everyone when the game finishes. The server then closes every
+        connection with code 1000. `yourRank` and `yourScore` are only present
+        for players.
+      required: [type, reason, podium, leaderboard, playerCount]
+      properties:
+        type: { const: final }
+        reason: { type: string, enum: [COMPLETED, HOST_ENDED, HOST_TIMEOUT, LOBBY_TIMEOUT] }
+        podium:
+          type: array
+          maxItems: 3
+          items: { $ref: '#/components/schemas/LeaderboardEntry' }
+        leaderboard:
+          type: array
+          maxItems: 10
+          items: { $ref: '#/components/schemas/LeaderboardEntry' }
+        playerCount: { type: integer }
+        yourRank: { type: integer }
+        yourScore: { type: integer }
+    WsError:
+      type: object
+      description: Sent when a client message is rejected. `status` mirrors the closest HTTP status code.
+      required: [type, status, code, message]
+      properties:
+        type: { const: error }
+        reqId: { $ref: '#/components/schemas/ReqId' }
+        requestType: { type: string, description: The `type` of the rejected message. }
+        status: { type: integer, enum: [400, 401, 403, 404, 409, 410, 422, 429, 500] }
+        code: { $ref: '#/components/schemas/WsErrorCode' }
+        message: { type: string }
+    WsErrorCode:
+      type: string
+      enum:
+        - INVALID_MESSAGE        # 400 bad JSON, unknown type, or missing field
+        - INVALID_CHOICE         # 400 choice outside 0-3
+        - INVALID_USERNAME       # 400 fails the Username pattern
+        - INVALID_RESPONSE_TIME  # 422 responseMs is negative or impossibly fast
+        - INVALID_TOKEN          # 401 hostToken or player token does not match
+        - NOT_HOST               # 403 host-only command sent from a player connection
+        - NOT_PLAYER             # 403 answer sent from the host connection
+        - GAME_NOT_FOUND         # 404 PIN unknown on this server
+        - WRONG_SERVER           # 404 PIN exists but is assigned to a different server (client should call GET /games/{pin})
+        - USERNAME_TAKEN         # 409
+        - GAME_FULL              # 409 maxPlayers reached
+        - JOINING_CLOSED         # 409 game already started (use rejoin)
+        - WRONG_PHASE            # 409 command not valid in the current phase
+        - WRONG_QUESTION         # 409 qIndex is not the open question
+        - ALREADY_ANSWERED       # 409
+        - DEADLINE_PASSED        # 410 the question has closed
+        - GAME_FINISHED          # 410
+        - RATE_LIMITED           # 429 more than 20 messages/s on one connection
+        - INTERNAL               # 500
+    ReqId:
+      type: string
+      maxLength: 64
+      description: Optional client-chosen ID. The server echoes it in the direct reply (`claimed`, `joined`, `snapshot`, `answer_ack` or `error`).
+
+# ──────────────────────────── WebSocket protocol ────────────────────────────
+x-websocket:
+  endpoint: ws://{serverIp}:8080/ws
+  encoding: One JSON object per text frame, with a required `type` field.
+  keepalive: |
+    The server sends a WebSocket ping every 20 s. A connection that misses
+    2 pongs is treated as disconnected: the player is kept in the game with
+    socket = null and can `rejoin`.
+  firstMessage: Must be `host_claim`, `join` or `rejoin` within 10 s, or the server closes with code 4008.
+  clientMessages:
+    host_claim:
+      schema: { $ref: '#/components/schemas/WsHostClaim' }
+      from: host
+      phases: [LOBBY, QUESTION, RESULTS]
+      success: claimed (then lobby / host_question / host_results to match the current phase)
+      errors: [INVALID_MESSAGE, GAME_NOT_FOUND, WRONG_SERVER, INVALID_TOKEN, GAME_FINISHED]
+      notes: If a host connection already exists, it is closed with code 4009 and replaced by the new one.
+    join:
+      schema: { $ref: '#/components/schemas/WsJoin' }
+      from: player
+      phases: [LOBBY]
+      success: joined
+      errors: [INVALID_MESSAGE, INVALID_USERNAME, GAME_NOT_FOUND, WRONG_SERVER, USERNAME_TAKEN,
+               GAME_FULL, JOINING_CLOSED, GAME_FINISHED]
+    rejoin:
+      schema: { $ref: '#/components/schemas/WsRejoin' }
+      from: player
+      phases: [LOBBY, QUESTION, RESULTS]
+      success: snapshot
+      errors: [INVALID_MESSAGE, GAME_NOT_FOUND, WRONG_SERVER, INVALID_TOKEN, GAME_FINISHED]
+      notes: An older socket for the same player is closed with code 4009.
+    start:
+      schema: { $ref: '#/components/schemas/WsStart' }
+      from: host
+      phases: [LOBBY]
+      success: question (to players) + host_question (to the host)
+      errors: [NOT_HOST, WRONG_PHASE]
+      notes: Rejected with WRONG_PHASE if there are 0 players.
+    next:
+      schema: { $ref: '#/components/schemas/WsNext' }
+      from: host
+      phases: [RESULTS]
+      success: question + host_question, or final after the last question
+      errors: [NOT_HOST, WRONG_PHASE]
+    end:
+      schema: { $ref: '#/components/schemas/WsEnd' }
+      from: host
+      phases: [LOBBY, QUESTION, RESULTS]
+      success: final (reason HOST_ENDED)
+      errors: [NOT_HOST, GAME_FINISHED]
+    answer:
+      schema: { $ref: '#/components/schemas/WsAnswer' }
+      from: player
+      phases: [QUESTION]
+      success: answer_ack
+      errors: [INVALID_MESSAGE, INVALID_CHOICE, INVALID_RESPONSE_TIME, NOT_PLAYER, WRONG_PHASE,
+               WRONG_QUESTION, ALREADY_ANSWERED, DEADLINE_PASSED, RATE_LIMITED]
+  serverMessages:
+    claimed: { schema: { $ref: '#/components/schemas/WsClaimed' }, to: host, trigger: successful host_claim }
+    joined: { schema: { $ref: '#/components/schemas/WsJoined' }, to: player, trigger: successful join }
+    snapshot: { schema: { $ref: '#/components/schemas/WsSnapshot' }, to: player, trigger: successful rejoin }
+    lobby: { schema: { $ref: '#/components/schemas/WsLobby' }, to: host, trigger: every 1 s during LOBBY }
+    question: { schema: { $ref: '#/components/schemas/WsQuestion' }, to: all players, trigger: start / next }
+    host_question: { schema: { $ref: '#/components/schemas/WsHostQuestion' }, to: host, trigger: start / next }
+    answer_ack: { schema: { $ref: '#/components/schemas/WsAnswerAck' }, to: player, trigger: accepted answer }
+    progress: { schema: { $ref: '#/components/schemas/WsProgress' }, to: host, trigger: at most every 500 ms during QUESTION }
+    results: { schema: { $ref: '#/components/schemas/WsResults' }, to: each player (personal), trigger: question closed }
+    host_results: { schema: { $ref: '#/components/schemas/WsHostResults' }, to: host, trigger: question closed }
+    final: { schema: { $ref: '#/components/schemas/WsFinal' }, to: everyone, trigger: game finished }
+    error: { schema: { $ref: '#/components/schemas/WsError' }, to: sender, trigger: rejected message }
+  closeCodes:
+    1000: Normal closure. The game finished, after `final` was sent.
+    1001: Going away. The server is shutting down; the client should call GET /games/{pin}.
+    1008: Policy violation. The first message was not host_claim / join / rejoin.
+    4001: Invalid token on host_claim or rejoin.
+    4004: Game not found on this server.
+    4008: No identifying first message within 10 s.
+    4009: Superseded. The same host or player connected from a newer socket.
+    4029: Rate limit exceeded repeatedly.
+
+# ───────────────── Internal calls (no public API) ─────────────────
+x-internal:
+  fleetManagerInvocations:
+    - source: EventBridge rule rate(1 minute)
+      payload: Standard EventBridge "Scheduled Event" JSON
+    - source: Directory Lambda (asynchronous Lambda Invoke, InvocationType=Event)
+      payload: { trigger: directory, reason: 'SPARE_USED | NO_CAPACITY', pin: '482193' }
+  fleetManagerAwsCalls:
+    - dynamodb:Scan / UpdateItem on Servers and Games (DRAINING, DEAD, FAILED, EXPIRED, emptySince)
+    - autoscaling:DescribeAutoScalingGroups
+    - autoscaling:SetDesiredCapacity (scale out)
+    - autoscaling:TerminateInstanceInAutoScalingGroup (scale in with decrement; dead server without decrement)
+  gameServerAwsCalls:
+    - name: register
+      when: on startup
+      call: dynamodb:PutItem Servers {serverId, address, capacity, reserved=0, status=ACTIVE, version}; mark the server's old games FAILED
+    - name: heartbeat
+      when: every 10 s
+      call: dynamodb:UpdateItem Servers SET heartbeatAt, connected, gameCount
+    - name: claimGame
+      when: host_claim
+      call: dynamodb:GetItem Games[pin] (verify serverId and hostTokenHash), dynamodb:GetItem Quizzes[quizId]; set status LOBBY
+    - name: startGame
+      when: start
+      call: dynamodb:UpdateItem Games status=PLAYING; Servers ADD reserved -(maxPlayers - playerCount)
+    - name: finishGame
+      when: final, or lobby idle 30 min
+      call: dynamodb:BatchWriteItem Results; Games status=ENDED (or EXPIRED); Servers ADD reserved -playerCount
