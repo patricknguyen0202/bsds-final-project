@@ -173,6 +173,8 @@ TransactWriteItems
 
 `:held` is the `reservedSlots` value the caller read. Whoever commits first sets it to 0, so the other caller fails its condition and the slots are released exactly once. Results are written first, so `status = ENDED` always means results exist.
 
+**Handling failure.** A failed transaction raises `TransactionCanceledException`, not `ConditionalCheckFailedException`. Read `CancellationReasons`. If the Games action reports `ConditionalCheckFailed`, the game is already closed, so do not retry. If any action reports `TransactionConflict`, another write is touching the same items, so retry with a short delay.
+
 ### W6. DRAINING transition (Fleet Manager, scale-in)
 
 ```

@@ -6,4 +6,9 @@
 
 **Mitigation (decided with Jared).** The player client shows a loading state and retries on 429. After a few failed retries it returns an error to the player.
 
-**For the experiments.** Join time and join failure rate in the 10,000 to 30,000 player tests depend on the throttle and on the retry settings (number of retries, delay). Record both with each result. Decide with Quang whether those runs keep the 2,000 req/s throttle or raise it.
+**For the experiments (decided with Quang).** Keep the throttle at 2,000 req/s for the 10,000 to 30,000 player join tests and measure:
+- joining time
+- percent of players who saw a 429 at least once
+- percent of players who could not join (still failing after the retries)
+
+These results depend on the retry settings (number of retries, delay), so record them with each run.
